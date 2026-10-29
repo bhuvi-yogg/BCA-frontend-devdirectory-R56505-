@@ -3,6 +3,61 @@ import http from 'node:http';
 
 const E = process.env;
 
+// --------------------------------------------------
+// CORS CONFIGURATION
+// --------------------------------------------------
+
+const allowedOrigins = new Set([
+  'https://bca-frontend-devdirectory-r56505.vercel.app',
+  'http://localhost:5173',
+]);
+
+function applyCors(req, res) {
+  const origin = req.headers.origin;
+
+  if (origin && allowedOrigins.has(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader(
+      'Access-Control-Allow-Methods',
+      'GET, POST, OPTIONS'
+    );
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      'Content-Type, Authorization'
+    );
+  }
+
+  if (req.method === 'OPTIONS') {
+    if (!origin || !allowedOrigins.has(origin)) {
+      res.writeHead(403);
+      res.end();
+      return true;
+    }
+
+    res.writeHead(204);
+    res.end();
+    return true;
+  }
+
+  return false;
+}
+
+// --------------------------------------------------
+// HTTP JSON HELPERS
+// --------------------------------------------------
+
+function send(res, status, data) {
+  if (res.headersSent || res.destroyed) return;
+
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+  });
+
+  res.end(JSON.stringify(data));
+}
+
 async function post(url, headers, body) {
   const response = await fetch(url, {
     method: 'POST',
@@ -11,26 +66,40 @@ async function post(url, headers, body) {
       ...headers,
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(30000),
   });
 
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
+    // Avoid returning provider responses that might contain
+    // sensitive information to the frontend.
+    const providerMessage =
+      data?.error?.message ||
+      data?.message ||
+      `Provider returned ${response.status}`;
+
     throw new Error(
-      data?.error?.message || `Provider returned ${response.status}`
+      String(providerMessage).slice(0, 500)
     );
   }
 
   return data;
 }
 
+// --------------------------------------------------
+// OPENAI-COMPATIBLE PROVIDERS
+// --------------------------------------------------
+
 const compat = (base, key, model) => async (system, messages) => {
   if (!base || !model) {
     throw new Error('Provider base URL or model is missing');
   }
 
+  const baseUrl = base.replace(/\/+$/, '');
+
   const data = await post(
-    `${base.replace(/\/+$/, '')}/chat/completions`,
+    `${baseUrl}/chat/completions`,
     key ? { Authorization: `Bearer ${key}` } : {},
     {
       model,
@@ -44,7 +113,10 @@ const compat = (base, key, model) => async (system, messages) => {
   return data.choices?.[0]?.message?.content;
 };
 
-// Read the model ID from .env. Accept either format.
+// --------------------------------------------------
+// GEMINI MODEL CONFIGURATION
+// --------------------------------------------------
+
 const geminiModel = String(E.GEMINI_MODEL || '')
   .trim()
   .replace(/^models\//, '');
@@ -53,6 +125,7 @@ const providers = {
   openai: {
     ready: Boolean(E.OPENAI_API_KEY && E.OPENAI_MODEL),
     model: E.OPENAI_MODEL || null,
+
     call: compat(
       E.OPENAI_BASE_URL || 'https://api.openai.com/v1',
       E.OPENAI_API_KEY,
@@ -63,6 +136,7 @@ const providers = {
   local: {
     ready: Boolean(E.LOCAL_BASE_URL && E.LOCAL_MODEL),
     model: E.LOCAL_MODEL || null,
+
     call: compat(
       E.LOCAL_BASE_URL,
       E.LOCAL_API_KEY,
@@ -76,17 +150,15 @@ const providers = {
 
     call: async (system, messages) => {
       if (!E.GEMINI_API_KEY) {
-        throw new Error('GEMINI_API_KEY is missing in .env');
+        throw new Error('Gemini API key is not configured');
       }
 
       if (!geminiModel) {
-        throw new Error('GEMINI_MODEL is missing in .env');
+        throw new Error('Gemini model is not configured');
       }
 
       const url =
         `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent`;
-
-      console.log('[Gemini] Requesting model:', geminiModel);
 
       const data = await post(
         url,
@@ -95,9 +167,15 @@ const providers = {
           systemInstruction: {
             parts: [{ text: system }],
           },
+
           contents: messages.map((message) => ({
-            role: message.role === 'assistant' ? 'model' : 'user',
-            parts: [{ text: String(message.content ?? '') }],
+            role: message.role === 'assistant'
+              ? 'model'
+              : 'user',
+
+            parts: [{
+              text: String(message.content ?? ''),
+            }],
           })),
         }
       );
@@ -119,7 +197,9 @@ const providers = {
   },
 
   anthropic: {
-    ready: Boolean(E.ANTHROPIC_API_KEY && E.ANTHROPIC_MODEL),
+    ready: Boolean(
+      E.ANTHROPIC_API_KEY && E.ANTHROPIC_MODEL
+    ),
     model: E.ANTHROPIC_MODEL || null,
 
     call: async (system, messages) => {
@@ -133,8 +213,12 @@ const providers = {
           model: E.ANTHROPIC_MODEL,
           max_tokens: 1024,
           system,
+
           messages: messages.map((message) => ({
-            role: message.role === 'assistant' ? 'assistant' : 'user',
+            role: message.role === 'assistant'
+              ? 'assistant'
+              : 'user',
+
             content: String(message.content ?? ''),
           })),
         }
@@ -146,6 +230,10 @@ const providers = {
     },
   },
 };
+
+// --------------------------------------------------
+// PROVIDER PRIORITY AND FALLBACK
+// --------------------------------------------------
 
 const primary = String(E.AI_PRIMARY || 'openai')
   .trim()
@@ -161,6 +249,10 @@ const order = [primary, fallback].filter(
     providers[name] &&
     names.indexOf(name) === index
 );
+
+// --------------------------------------------------
+// AI TASK PROMPTS
+// --------------------------------------------------
 
 const TASKS = {
   generate:
@@ -212,42 +304,68 @@ Routes: / home, /users directory, /users/:id profile, /login, /add-post (sign-in
 Answer briefly about finding developers, publishing articles and using the site. Use only the public developer data supplied.
 Never reveal credentials, admin data or private information, and never invent features.`;
 
-function send(response, status, data) {
-  response.writeHead(status, {
-    'Content-Type': 'application/json',
-  });
-  response.end(JSON.stringify(data));
-}
+// --------------------------------------------------
+// SERVER AND ROUTES
+// --------------------------------------------------
 
 const server = http.createServer((req, res) => {
-  const pathname = new URL(
-    req.url,
-    'http://localhost'
-  ).pathname;
+  // CORS must run before handling API routes.
+  if (applyCors(req, res)) return;
 
-  if (pathname === '/api/ai/status' && req.method === 'GET') {
+  let pathname;
+
+  try {
+    pathname = new URL(
+      req.url,
+      'http://localhost'
+    ).pathname;
+  } catch {
+    return send(res, 400, {
+      error: 'Invalid request URL',
+    });
+  }
+
+  // Health/status endpoint
+  if (
+    pathname === '/api/ai/status' &&
+    req.method === 'GET'
+  ) {
     return send(res, 200, {
-      configured: order.some((name) => providers[name].ready),
-      providers: Object.entries(providers).map(([name, provider]) => ({
-        name,
-        ready: provider.ready,
-        model: provider.ready ? provider.model : null,
-      })),
+      configured: order.some(
+        (name) => providers[name].ready
+      ),
+
+      providers: Object.entries(providers).map(
+        ([name, provider]) => ({
+          name,
+          ready: provider.ready,
+          model: provider.ready ? provider.model : null,
+        })
+      ),
+
       order,
     });
   }
 
-  if (pathname === '/api/ai' && req.method === 'POST') {
+  // AI request endpoint
+  if (
+    pathname === '/api/ai' &&
+    req.method === 'POST'
+  ) {
     let raw = '';
     let tooLarge = false;
 
     req.on('data', (chunk) => {
-      raw += chunk;
+      if (tooLarge) return;
 
-      if (raw.length > 20000 && !tooLarge) {
+      raw += chunk.toString();
+
+      if (Buffer.byteLength(raw, 'utf8') > 20000) {
         tooLarge = true;
-        send(res, 413, { error: 'Request body too large' });
-        req.destroy();
+
+        send(res, 413, {
+          error: 'Request body too large',
+        });
       }
     });
 
@@ -261,7 +379,7 @@ const server = http.createServer((req, res) => {
           title = '',
           messages = [],
           context = '',
-        } = JSON.parse(raw);
+        } = JSON.parse(raw || '{}');
 
         let system;
         let msgs;
@@ -273,8 +391,12 @@ const server = http.createServer((req, res) => {
           msgs = (Array.isArray(messages) ? messages : [])
             .slice(-10)
             .map((message) => ({
-              role: message.role === 'assistant' ? 'assistant' : 'user',
-              content: String(message.content ?? '').slice(0, 1000),
+              role: message.role === 'assistant'
+                ? 'assistant'
+                : 'user',
+
+              content: String(message.content ?? '')
+                .slice(0, 1000),
             }));
         } else if (TASKS[action]) {
           system =
@@ -282,21 +404,29 @@ const server = http.createServer((req, res) => {
 
           msgs = [{
             role: 'user',
+
             content:
               `Title: ${String(title).slice(0, 200)}\n` +
               `Text: ${String(text).slice(0, 12000)}`,
           }];
         } else {
-          return send(res, 400, { error: 'Unknown action' });
+          return send(res, 400, {
+            error: 'Unknown action',
+          });
         }
 
         const errors = [];
 
-        for (const name of order.filter(
-          (providerName) => providers[providerName].ready
-        )) {
+        const readyProviders = order.filter(
+          (name) => providers[name].ready
+        );
+
+        for (const name of readyProviders) {
           try {
-            const output = await providers[name].call(system, msgs);
+            const output = await providers[name].call(
+              system,
+              msgs
+            );
 
             if (output) {
               return send(res, 200, {
@@ -308,33 +438,54 @@ const server = http.createServer((req, res) => {
 
             errors.push(`${name}: Empty response`);
           } catch (error) {
+            // Do not log API keys or request headers.
             console.error(
               `[AI proxy] ${name} failed:`,
               error.message
             );
-            errors.push(`${name}: ${error.message}`);
+
+            errors.push(
+              `${name}: ${String(error.message).slice(0, 300)}`
+            );
           }
         }
 
         return send(res, 502, {
-          error: errors.join(' | ') || 'No AI provider is configured',
+          error: errors.join(' | ') ||
+            'No AI provider is configured',
         });
       } catch (error) {
-        console.error('[AI proxy] Request failed:', error.message);
-        return send(res, 400, { error: 'Bad request' });
+        console.error(
+          '[AI proxy] Request failed:',
+          error.message
+        );
+
+        return send(res, 400, {
+          error: 'Bad request',
+        });
       }
     });
 
     return;
   }
 
-  return send(res, 404, { error: 'Not found' });
+  return send(res, 404, {
+    error: 'Not found',
+  });
 });
 
-server.listen(Number(E.PORT) || 8787, () => {
+// --------------------------------------------------
+// START SERVER
+// --------------------------------------------------
+
+const port = Number(E.PORT) || 8787;
+
+server.listen(port, '0.0.0.0', () => {
   console.log(
-    `AI proxy on :${Number(E.PORT) || 8787} | providers ready:`,
-    order.filter((name) => providers[name].ready).join(', ') || 'none'
+    `[AI proxy] Listening on port ${port} | providers ready:`,
+    order.filter(
+      (name) => providers[name].ready
+    ).join(', ') || 'none'
   );
 
   console.log(
