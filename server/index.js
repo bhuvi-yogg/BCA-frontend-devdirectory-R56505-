@@ -1,4 +1,4 @@
-
+```javascript
 import http from 'node:http';
 
 const E = process.env;
@@ -26,12 +26,15 @@ function applyCors(req, res) {
       'Access-Control-Allow-Headers',
       'Content-Type, Authorization'
     );
+    res.setHeader('Access-Control-Max-Age', '86400');
   }
 
+  // Handle browser preflight BEFORE route matching.
   if (req.method === 'OPTIONS') {
     if (!origin || !allowedOrigins.has(origin)) {
-      res.writeHead(403);
-      res.end();
+      send(res, 403, {
+        error: 'Origin not allowed',
+      });
       return true;
     }
 
@@ -72,8 +75,6 @@ async function post(url, headers, body) {
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    // Avoid returning provider responses that might contain
-    // sensitive information to the frontend.
     const providerMessage =
       data?.error?.message ||
       data?.message ||
@@ -309,7 +310,7 @@ Never reveal credentials, admin data or private information, and never invent fe
 // --------------------------------------------------
 
 const server = http.createServer((req, res) => {
-  // CORS must run before handling API routes.
+  // IMPORTANT: CORS and OPTIONS run before URL route matching.
   if (applyCors(req, res)) return;
 
   let pathname;
@@ -366,6 +367,8 @@ const server = http.createServer((req, res) => {
         send(res, 413, {
           error: 'Request body too large',
         });
+
+        req.destroy();
       }
     });
 
@@ -492,3 +495,4 @@ server.listen(port, '0.0.0.0', () => {
     `[AI proxy] Gemini model configured: ${geminiModel || 'none'}`
   );
 });
+```
